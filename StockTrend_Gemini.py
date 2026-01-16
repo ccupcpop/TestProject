@@ -37,6 +37,9 @@ SHADOW_LIMIT = 0.2          # 上影線佔比上限 (0.2代表不可超過全幅
 MA_SHORT = 5                # 短期均線天數
 MA_LONG = 20                # 中期均線天數
 
+# 輸出控制
+OUTPUT_CSV = False          # 是否輸出CSV檔案
+
 # ==============================
 # 📊 資料庫讀取函數
 # ==============================
@@ -71,7 +74,7 @@ def read_stock_from_db(stock_code):
     return None
 
 def get_all_stock_codes():
-    """從資料庫獲取所有股票代碼"""
+    """從資料庫獲取所有股票代碼（排除ETF）"""
     codes = set()
     
     if Path(DB_TSE_PATH).exists():
@@ -94,7 +97,10 @@ def get_all_stock_codes():
         except:
             pass
     
-    return sorted(list(codes))
+    # 排除ETF（股票代碼以00開頭的）
+    filtered_codes = [code for code in codes if not code.startswith('00')]
+    
+    return sorted(filtered_codes)
 
 # ==============================
 # 📈 【唯一分析引擎】screen_stocks
@@ -148,6 +154,8 @@ def screen_stocks(df,
             
         df['MA_S'] = df['收盤價'].rolling(window=ma_short).mean()
         df['MA_L'] = df['收盤價'].rolling(window=ma_long).mean()
+        df['MA20'] = df['收盤價'].rolling(window=20).mean()
+        df['MA60'] = df['收盤價'].rolling(window=60).mean()
         df['VolMA'] = df['成交張數'].rolling(window=ma_short).mean()
         
         latest = df.iloc[-1]
@@ -344,6 +352,8 @@ def generate_stock_chart(stock_code, stock_name, csv_file, output_folder, stock_
         # 計算移動平均線
         df_chart['MA5'] = df_chart['收盤價'].rolling(window=5, min_periods=1).mean()
         df_chart['MA10'] = df_chart['收盤價'].rolling(window=10, min_periods=1).mean()
+        df_chart['MA20'] = df_chart['收盤價'].rolling(window=20, min_periods=1).mean()
+        df_chart['MA60'] = df_chart['收盤價'].rolling(window=60, min_periods=1).mean()
         
         # 創建子圖
         fig = make_subplots(
@@ -376,8 +386,13 @@ def generate_stock_chart(stock_code, stock_name, csv_file, output_folder, stock_
             row=1, col=1
         )
         
-        # 添加MA5和MA10
-        for ma_name, ma_col, color in [('MA5', 'MA5', 'blue'), ('MA10', 'MA10', 'orange')]:
+        # 添加MA5、MA10、MA20、MA60
+        for ma_name, ma_col, color in [
+            ('MA5', 'MA5', 'blue'), 
+            ('MA10', 'MA10', 'orange'),
+            ('MA20', 'MA20', 'purple'),
+            ('MA60', 'MA60', 'brown')
+        ]:
             if ma_col in df_chart.columns and df_chart[ma_col].notna().sum() > 0:
                 fig.add_trace(
                     go.Scatter(
@@ -884,7 +899,7 @@ def main():
     base_output_folder.mkdir(exist_ok=True)
     
     # 建立以日期命名的子資料夾（前綴 full_）
-    output_folder = base_output_folder / f"full_{latest_date_str}"
+    output_folder = base_output_folder / f"full_{latest_date_str}_Gemini"
     output_folder.mkdir(exist_ok=True)
     
     # ==========================================
@@ -899,7 +914,8 @@ def main():
         print(f"📁 資料庫中沒有股票資料！")
         return
     
-    print(f"📁 輸出資料夾: {output_folder}\n")
+    print(f"📁 輸出資料夾: {output_folder}")
+    print(f"📊 股票總數: {len(stock_codes)} 檔（已排除ETF）\n")
 
     enabled = []
     if USE_PRICE: enabled.append(f"股價≤{MAX_PRICE}")
@@ -910,7 +926,9 @@ def main():
     if USE_SHAPE: enabled.append(f"上影線≤{SHADOW_LIMIT*100}%")
     
     print(f"🔍 掃描 {len(stock_codes)} 檔股票...")
-    print(f"   • 啟用條件: {' + '.join(enabled) if enabled else '無'}\n")
+    print(f"   • 啟用條件: {' + '.join(enabled) if enabled else '無'}")
+    print(f"   • 輸出CSV: {'✅ 啟用' if OUTPUT_CSV else '❌ 關閉'}")
+    print()
 
     # 篩選符合條件的股票
     results = []
@@ -984,14 +1002,15 @@ def main():
                 if generate_stock_chart(code, name, None, output_folder, type_str, sector):
                     chart_count += 1
                 
-                # 輸出 CSV 檔案
-                try:
-                    csv_path = output_folder / f"{code}_{name}.csv"
-                    stock_df_sorted = stock_df.sort_values('日期', ascending=False)
-                    stock_df_sorted.to_csv(csv_path, index=False, encoding='utf-8-sig')
-                    print(f"    📄 輸出 CSV: {code}_{name}.csv")
-                except Exception as e:
-                    print(f"    ⚠️  輸出 CSV 失敗: {e}")
+                # 輸出 CSV 檔案（依據Flag控制）
+                if OUTPUT_CSV:
+                    try:
+                        csv_path = output_folder / f"{code}_{name}.csv"
+                        stock_df_sorted = stock_df.sort_values('日期', ascending=False)
+                        stock_df_sorted.to_csv(csv_path, index=False, encoding='utf-8-sig')
+                        print(f"    📄 輸出 CSV: {code}_{name}.csv")
+                    except Exception as e:
+                        print(f"    ⚠️  輸出 CSV 失敗: {e}")
             else:
                 print(f"    ⚠️  資料不足，無法分析")
             

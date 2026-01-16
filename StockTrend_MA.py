@@ -947,7 +947,7 @@ def main():
     base_output_folder.mkdir(exist_ok=True)
     
     # 建立以日期命名的子資料夾（前綴 full_）
-    output_folder = base_output_folder / f"full_{latest_date_str}"
+    output_folder = base_output_folder / f"full_{latest_date_str}_MA"
     
     # 如果資料夾已存在，先清空內容
     if output_folder.exists():
