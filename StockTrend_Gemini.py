@@ -390,8 +390,8 @@ def generate_stock_chart(stock_code, stock_name, csv_file, output_folder, stock_
         for ma_name, ma_col, color in [
             ('MA5', 'MA5', 'blue'), 
             ('MA10', 'MA10', 'orange'),
-            ('MA20', 'MA20', 'purple'),
-            ('MA60', 'MA60', 'brown')
+            ('MA20', 'MA20', 'green'),
+            ('MA60', 'MA60', 'purple')
         ]:
             if ma_col in df_chart.columns and df_chart[ma_col].notna().sum() > 0:
                 fig.add_trace(

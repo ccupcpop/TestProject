@@ -23,13 +23,21 @@ DB_OTC_PATH = "stock_data/stock_otc_all.db"  # 上櫃股票資料庫
 # ==============================
 # 條件開關
 USE_PRICE = True       # 是否過濾股價上限
-USE_MA = True          # 是否要求MA5/MA60向上
-USE_VOL = True         # 是否要求近期爆量
+USE_MA = True          # 是否要求多頭排列 (趨勢)
+USE_VOL = True         # 是否要求量能爆發 (動能)
+USE_MIN_VOL = True     # 是否要求最低成交量
+USE_INST = True        # 是否要求法人買超 (籌碼)
+USE_SHAPE = True       # 是否過濾K線型態 (上影線)
+USE_MA20_CROSS_MA60 = False  # 是否要求MA20突破MA60
 
 # 變數控制
 MAX_PRICE = 150.0           # 股價上限
-VOLUME_PERIOD = 15          # 計算最高成交量的觀察期間（天）
-RECENT_DAYS = 3             # 定義「最近N天」
+VOL_RATIO_LIMIT = 1.2       # 成交量倍數 (當日/5日均量)
+MIN_VOLUME = 5000           # 最低成交量（張）
+SHADOW_LIMIT = 0.2          # 上影線佔比上限 (0.2代表不可超過全幅20%)
+MA_SHORT = 5                # 短期均線天數
+MA_LONG = 20                # 中期均線天數
+MA20_CROSS_MA60_DAYS = 5    # MA20突破MA60的檢查天數
 MA_UPTREND_DAYS = 5         # 檢查均線連續向上的天數
 
 # 輸出控制
@@ -100,30 +108,32 @@ def get_all_stock_codes():
 # ==============================
 # 📈 【唯一分析引擎】screen_stocks
 # ==============================
-def screen_stocks(df, max_price=150.0, volume_period=15, recent_days=3, ma_uptrend_days=5):
+def screen_stocks(df, max_price=150.0, ma20_cross_days=5, use_ma20_cross=False, ma_uptrend_days=5):
     """
-    股票篩選分析引擎 - 捕捉放量起漲點
+    股票篩選分析引擎（接受 DataFrame）
     
-    篩選邏輯：
+    新的篩選邏輯（純MA分析）：
     1. 股價上限控制
-    2. MA5 向上 (連續N天上漲)
-    3. MA60 向上 (連續N天上漲)
-    4. 過去VOLUME_PERIOD天內的最高成交量發生在最近RECENT_DAYS天內
+    2. 最近30天K線最高最低都在MA60上方
+    3. 最近5天呈現多頭排列(MA5>MA10>MA20>MA60)
+    4. 四條均線連續向上（過去N天內，每天都比前一天高）
+    5. MA20在指定天數內與MA60有突破交叉（可選）
     
     參數:
         df: 股票數據DataFrame
         max_price: 股價上限，預設150元
-        volume_period: 觀察最高成交量的期間（天），預設15天
-        recent_days: 定義「最近N天」，預設3天
+        ma20_cross_days: MA20突破MA60的檢查天數，預設5天
+        use_ma20_cross: 是否啟用MA20突破MA60條件，預設False
         ma_uptrend_days: 檢查均線連續向上的天數，預設5天
     
     返回格式：
     {
-        "stock_code": "2330",
+        "股票": "2330 台積電",
         "收盤價": 580.0,
-        "latest_date": "2025.01.15",
-        "max_vol_date": "2025.01.14",
-        "max_volume": 50000
+        "漲跌幅": "1.5%",
+        "量能倍數": 1.5,
+        "法人買超張數": 1000,
+        "上影線比例": "10.0%"
     }
     或 None（不符合條件）
     """
@@ -134,108 +144,124 @@ def screen_stocks(df, max_price=150.0, volume_period=15, recent_days=3, ma_uptre
         df = df.sort_values('日期').reset_index(drop=True)
         
         # 移除千位分隔符並轉換數值
-        for col in ['收盤價', '開盤價', '最高價', '最低價', '成交張數']:
+        for col in ['收盤價', '開盤價', '最高價', '最低價', '成交張數', 
+                    '外陸資買賣超張數', '投信買賣超張數', '自營商買賣超張數']:
             if col in df.columns:
                 df[col] = df[col].astype(str).str.replace(',', '', regex=False)
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # 需要至少90天數據來計算完整的MA60並檢查30天趨勢
-        if len(df) < 90: 
+        # 需要至少60天數據來計算MA60
+        if len(df) < 60: 
             return None
             
-        # 計算均線
+        # 計算四條均線
         df['MA5'] = df['收盤價'].rolling(window=5).mean()
+        df['MA10'] = df['收盤價'].rolling(window=10).mean()
+        df['MA20'] = df['收盤價'].rolling(window=20).mean()
         df['MA60'] = df['收盤價'].rolling(window=60).mean()
+        df['VolMA'] = df['成交張數'].rolling(window=5).mean()
         
         latest = df.iloc[-1]
+        prev = df.iloc[-2]
         
-        # ========================================
-        # 條件1: 股價上限
-        # ========================================
-        if latest['收盤價'] > max_price:
-            return None
+        # 2. 新的條件判斷邏輯（只基於MA分析）
         
-        # ========================================
-        # 條件2: MA5 連續向上
-        # ========================================
-        if len(df) < ma_uptrend_days + 1:
-            return None
-            
-        last_n_plus_1 = df.tail(ma_uptrend_days + 1)
-        ma5_uptrend = True
+        # 條件0: 股價上限
+        c_price = latest['收盤價'] <= max_price
         
-        for i in range(1, len(last_n_plus_1)):
-            idx_prev = last_n_plus_1.index[i-1]
-            idx_curr = last_n_plus_1.index[i]
-            
-            if pd.notna(last_n_plus_1.loc[idx_prev, 'MA5']) and \
-               pd.notna(last_n_plus_1.loc[idx_curr, 'MA5']):
-                if last_n_plus_1.loc[idx_curr, 'MA5'] <= last_n_plus_1.loc[idx_prev, 'MA5']:
-                    ma5_uptrend = False
+        # 條件1: 最近30天K線最高最低都在MA60上方
+        last_30 = df.tail(30)
+        c_above_ma60 = True
+        if len(last_30) >= 30:
+            for idx, row in last_30.iterrows():
+                if pd.notna(row['MA60']) and (row['最低價'] < row['MA60']):
+                    c_above_ma60 = False
                     break
-            else:
-                ma5_uptrend = False
-                break
+        else:
+            c_above_ma60 = False
         
-        if not ma5_uptrend:
-            return None
+        # 條件2: 最近5天呈現多頭排列 (MA5>MA10>MA20>MA60)
+        last_5 = df.tail(5)
+        c_bullish_alignment = True
+        if len(last_5) >= 5:
+            for idx, row in last_5.iterrows():
+                if pd.notna(row['MA5']) and pd.notna(row['MA10']) and \
+                   pd.notna(row['MA20']) and pd.notna(row['MA60']):
+                    if not (row['MA5'] > row['MA10'] > row['MA20'] > row['MA60']):
+                        c_bullish_alignment = False
+                        break
+        else:
+            c_bullish_alignment = False
         
-        # ========================================
-        # 條件3: MA60 最近30天連續向上
-        # ========================================
-        if len(df) < 90:  # 需要至少 60 + 30 天的數據
-            return None
+        # 條件3: 四條均線連續向上（過去N天內，每天都比前一天高）
+        c_ma_uptrend = True
+        if len(df) >= ma_uptrend_days + 1:  # 需要N+1天數據（N天+前一天）
+            # 取最近N+1天的數據
+            last_n_plus_1 = df.tail(ma_uptrend_days + 1)
+            
+            # 檢查每條均線在過去N天內是否連續上升
+            for ma in ['MA5', 'MA10', 'MA20', 'MA60']:
+                # 檢查這N天中，每天都比前一天高
+                for i in range(1, len(last_n_plus_1)):
+                    idx_prev = last_n_plus_1.index[i-1]
+                    idx_curr = last_n_plus_1.index[i]
+                    
+                    if pd.notna(last_n_plus_1.loc[idx_prev, ma]) and pd.notna(last_n_plus_1.loc[idx_curr, ma]):
+                        # 如果當天的值 <= 前一天的值，則不符合連續上升
+                        if last_n_plus_1.loc[idx_curr, ma] <= last_n_plus_1.loc[idx_prev, ma]:
+                            c_ma_uptrend = False
+                            break
+                    else:
+                        c_ma_uptrend = False
+                        break
+                
+                # 如果任一均線不符合，就跳出
+                if not c_ma_uptrend:
+                    break
+        else:
+            c_ma_uptrend = False
         
-        # 取最近30天的數據
-        recent_30_days = df.iloc[-30:]
-        ma60_values = recent_30_days['MA60'].values
+        # 條件4: MA20在指定天數內與MA60有突破交叉（可選）
+        c_ma20_cross_ma60 = True  # 預設為True，如果不啟用此條件則恆為True
+        if use_ma20_cross:
+            c_ma20_cross_ma60 = False
+            if len(df) >= ma20_cross_days:
+                last_n = df.tail(ma20_cross_days)
+                for i in range(1, len(last_n)):
+                    idx_prev = last_n.index[i-1]
+                    idx_curr = last_n.index[i]
+                    # 檢查MA20從下方突破MA60 (黃金交叉)
+                    if pd.notna(last_n.loc[idx_prev, 'MA20']) and pd.notna(last_n.loc[idx_prev, 'MA60']) and \
+                       pd.notna(last_n.loc[idx_curr, 'MA20']) and pd.notna(last_n.loc[idx_curr, 'MA60']):
+                        if (last_n.loc[idx_prev, 'MA20'] <= last_n.loc[idx_prev, 'MA60'] and 
+                            last_n.loc[idx_curr, 'MA20'] > last_n.loc[idx_curr, 'MA60']):
+                            c_ma20_cross_ma60 = True
+                            break
         
-        # 檢查最近30天的 MA60 是否連續向上
-        for i in range(1, len(ma60_values)):
-            if ma60_values[i] <= ma60_values[i-1]:
-                return None
+        # 計算一些統計數據供輸出用
+        actual_vol_ratio = latest['成交張數'] / latest['VolMA'] if latest['VolMA'] != 0 else 0
+        inst_total = latest['外陸資買賣超張數'] + latest['投信買賣超張數'] + latest['自營商買賣超張數']
+        candle_range = latest['最高價'] - latest['最低價']
+        upper_shadow = latest['最高價'] - max(latest['開盤價'], latest['收盤價'])
+        actual_shadow_ratio = upper_shadow / (candle_range + 0.01)
         
-        
-        # ========================================
-        # 條件4: 過去VOLUME_PERIOD天的最高量在最近RECENT_DAYS天內
-        # ========================================
-        if len(df) < volume_period:
-            return None
-        
-        # 取過去volume_period天的數據
-        last_period = df.tail(volume_period)
-        
-        # 找到最高成交量及其日期
-        max_vol_idx = last_period['成交張數'].idxmax()
-        max_volume = last_period.loc[max_vol_idx, '成交張數']
-        max_vol_date = last_period.loc[max_vol_idx, '日期']
-        
-        # 檢查最高量是否在最近recent_days天內
-        last_recent = df.tail(recent_days)
-        
-        is_recent_max = False
-        for idx, row in last_recent.iterrows():
-            if row['日期'] == max_vol_date:
-                is_recent_max = True
-                break
-        
-        if not is_recent_max:
-            return None
-        
-        # ========================================
-        # 通過所有條件，返回結果
-        # ========================================
-        stock_code = str(latest.get('股票代碼', ''))
-        
-        return {
-            'stock_code': stock_code,
-            '收盤價': float(latest['收盤價']),
-            'latest_date': latest['日期'].strftime('%Y.%m.%d'),
-            'max_vol_date': max_vol_date.strftime('%Y.%m.%d'),
-            'max_volume': int(max_volume)
-        }
+        # 3. 綜合判定（只基於MA條件）
+        if all([c_price, c_above_ma60, c_bullish_alignment, c_ma_uptrend, c_ma20_cross_ma60]):
+            return {
+                "股票": f"{latest['股票代碼']} {latest['股票名稱']}",
+                "收盤價": latest['收盤價'],
+                "漲跌幅": f"{round(((latest['收盤價']-prev['收盤價'])/prev['收盤價'])*100, 2)}%",
+                "量能倍數": round(actual_vol_ratio, 2),
+                "法人買超張數": inst_total,
+                "上影線比例": f"{round(actual_shadow_ratio*100, 1)}%",
+                "latest_date": latest['日期'].strftime('%Y.%m.%d'),
+                "stock_code": latest['股票代碼'],
+                "stock_name": latest['股票名稱']
+            }
+        return None
         
     except Exception as e:
+        print(f"處理股票時出錯: {e}")
         return None
 
 # ==============================
@@ -328,8 +354,8 @@ def generate_stock_chart(stock_code, stock_name, csv_file, output_folder, stock_
         latest_close_str = f"{latest_close:.2f}"
         
         # ===== 執行篩選分析（用新的 screen_stocks 引擎）=====
-        screen_result = screen_stocks(df, max_price=MAX_PRICE, volume_period=VOLUME_PERIOD,
-                                     recent_days=RECENT_DAYS, ma_uptrend_days=MA_UPTREND_DAYS)
+        screen_result = screen_stocks(df, max_price=MAX_PRICE, ma20_cross_days=MA20_CROSS_MA60_DAYS, 
+                                     use_ma20_cross=USE_MA20_CROSS_MA60, ma_uptrend_days=MA_UPTREND_DAYS)
         
         # 轉換成原本 analyze_volume_price_pattern 的格式
         if screen_result:
@@ -337,12 +363,13 @@ def generate_stock_chart(stock_code, stock_name, csv_file, output_folder, stock_
                 'action': '上車',
                 'risk_level': '中',
                 'score': 5,
-                'summary': f"符合篩選條件：MA5/MA60向上，爆量日 {screen_result['max_vol_date']}",
+                'summary': f"符合篩選條件：量能倍數 {screen_result['量能倍數']}，法人買超 {screen_result['法人買超張數']:.0f}張",
                 'signals': [
                     f"✅ 收盤價: {screen_result['收盤價']:.2f}",
-                    f"📅 最新日期: {screen_result['latest_date']}",
-                    f"💥 爆量日: {screen_result['max_vol_date']}",
-                    f"📊 最高量: {screen_result['max_volume']} 張"
+                    f"📊 漲跌幅: {screen_result['漲跌幅']}",
+                    f"🔥 量能倍數: {screen_result['量能倍數']}",
+                    f"💰 法人買超: {screen_result['法人買超張數']:.0f}張",
+                    f"📈 上影線比例: {screen_result['上影線比例']}"
                 ]
             }
         else:
@@ -367,14 +394,14 @@ def generate_stock_chart(stock_code, stock_name, csv_file, output_folder, stock_
         
         output_path = output_folder / output_filename
         
-        # 先在完整資料上計算移動平均線
-        df['MA5'] = df['收盤價'].rolling(window=5, min_periods=1).mean()
-        df['MA10'] = df['收盤價'].rolling(window=10, min_periods=1).mean()
-        df['MA20'] = df['收盤價'].rolling(window=20, min_periods=1).mean()
-        df['MA60'] = df['收盤價'].rolling(window=60, min_periods=1).mean()
-        
-        # 然後取最近60筆資料來畫圖
+        # 取最近60筆資料
         df_chart = df.tail(60).copy()
+        
+        # 計算移動平均線
+        df_chart['MA5'] = df_chart['收盤價'].rolling(window=5, min_periods=1).mean()
+        df_chart['MA10'] = df_chart['收盤價'].rolling(window=10, min_periods=1).mean()
+        df_chart['MA20'] = df_chart['收盤價'].rolling(window=20, min_periods=1).mean()
+        df_chart['MA60'] = df_chart['收盤價'].rolling(window=60, min_periods=1).mean()
         
         # 創建子圖
         fig = make_subplots(
@@ -949,10 +976,12 @@ def main():
     # 新的篩選條件說明
     enabled = [
         f"股價 ≤ {MAX_PRICE}元",
-        f"MA5 連續{MA_UPTREND_DAYS}天向上",
-        f"MA60 最近30天連續向上",
-        f"過去{VOLUME_PERIOD}天最高量在最近{RECENT_DAYS}天內"
+        "最近30天K線在MA60上方",
+        "最近5天多頭排列(MA5>MA10>MA20>MA60)",
+        f"四條均線連續{MA_UPTREND_DAYS}天向上"
     ]
+    if USE_MA20_CROSS_MA60:
+        enabled.append(f"MA20在{MA20_CROSS_MA60_DAYS}天內突破MA60")
     
     print(f"🔍 掃描 {len(stock_codes)} 檔股票...")
     print(f"   • 啟用條件:")
@@ -968,16 +997,14 @@ def main():
         if df is None or len(df) == 0:
             continue
         
-        res = screen_stocks(df, max_price=MAX_PRICE, volume_period=VOLUME_PERIOD,
-                           recent_days=RECENT_DAYS, ma_uptrend_days=MA_UPTREND_DAYS)
+        res = screen_stocks(df, max_price=MAX_PRICE, ma20_cross_days=MA20_CROSS_MA60_DAYS, 
+                           use_ma20_cross=USE_MA20_CROSS_MA60, ma_uptrend_days=MA_UPTREND_DAYS)
         
         if res:
             results.append({
                 'code': res['stock_code'],
                 'latest_date': res['latest_date'],
                 'latest_close': res['收盤價'],
-                'max_vol_date': res['max_vol_date'],
-                'max_volume': res['max_volume'],
                 'last_volume': df['成交張數'].iloc[-1] if '成交張數' in df.columns else 0
             })
 
@@ -1012,9 +1039,7 @@ def main():
                         # 顯示資料庫的所有欄位
                         print(f"    資料庫欄位: {list(stock_df_temp.columns)}")
 
-            print(f"{code} | {name} | {type_str} | {sector}")
-            print(f"    📅 日期: {r['latest_date']} | 💰 收盤: {r['latest_close']:.2f}")
-            print(f"    💥 最高量日: {r['max_vol_date']} ({r['max_volume']} 張)")
+            print(f"{code} | {name} | {type_str} | {sector} | 日期: {r['latest_date']} | 收盤: {r['latest_close']:.2f}")
             
             # 讀取股票資料
             stock_df = read_stock_from_db(code)
