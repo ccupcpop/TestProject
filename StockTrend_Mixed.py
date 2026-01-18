@@ -30,7 +30,7 @@ USE_VOL = True         # 是否要求近期爆量
 MAX_PRICE = 150.0           # 股價上限
 VOLUME_PERIOD = 15          # 計算最高成交量的觀察期間（天）
 RECENT_DAYS = 3             # 定義「最近N天」
-MA5_UPTREND_DAYS = 2         # 檢查均線連續向上的天數
+MA_UPTREND_DAYS = 2         # 檢查均線連續向上的天數
 
 # 輸出控制
 OUTPUT_CSV = False           # 是否輸出CSV檔案
@@ -98,32 +98,232 @@ def get_all_stock_codes():
     return sorted(filtered_codes)
 
 # ==============================
-# 📈 【唯一分析引擎】screen_stocks
+# 📈 【融合分析引擎】IntegratedStockAnalysisEngine
+# ==============================
+class IntegratedStockAnalysisEngine:
+    """
+    專業股票起漲點融合引擎
+    整合邏輯：Minervini 趨勢模板 + VCP 波動收縮 + 帶量 K 線突破
+    """
+    def __init__(self, df):
+        self.df = df.copy()
+        self._calculate_technical_indicators()
+
+    def _calculate_technical_indicators(self):
+        # 1. 計算趋势過濾器需要的移動平均線 (SMA)
+        self.df['SMA5'] = self.df['Close'].rolling(window=5).mean()   # 加入 MA5
+        self.df['SMA10'] = self.df['Close'].rolling(window=10).mean()  # 加入 MA10
+        self.df['SMA50'] = self.df['Close'].rolling(window=50).mean()
+        self.df['SMA60'] = self.df['Close'].rolling(window=60).mean()  # 加入 MA60
+        self.df['SMA150'] = self.df['Close'].rolling(window=150).mean()
+        self.df['SMA200'] = self.df['Close'].rolling(window=200).mean()
+        
+        # 2. 計算高低點（使用可用數據範圍，最多150天）
+        window_size = min(150, len(self.df))
+        self.df['Low52'] = self.df['Low'].rolling(window=window_size, min_periods=30).min()
+        self.df['High52'] = self.df['High'].rolling(window=window_size, min_periods=30).max()
+        
+        # 3. 量能指標：計算 20 日平均成交量與量比
+        self.df['VolMA20'] = self.df['Volume'].rolling(window=20).mean()
+        self.df['VolRatio'] = self.df['Volume'] / self.df['VolMA20']
+        
+        # 4. 波動率指標 (ATR) 用於 VCP 偵測
+        high_low = self.df['High'] - self.df['Low']
+        high_close = np.abs(self.df['High'] - self.df['Close'].shift())
+        low_close = np.abs(self.df['Low'] - self.df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        self.df['ATR'] = ranges.max(axis=1).rolling(window=20).mean()
+        
+        # 5. 價格緊緻度 (Volatility Tightness)：近 5 日波幅相對於收盤價的表現
+        self.df['PriceRange'] = (self.df['High'] - self.df['Low']) / self.df['Close']
+
+    def _check_trend_template(self, i):
+        """
+        篩選準則：確認股票處於 Minervini 第二階段上升趨勢
+        """
+        row = self.df.iloc[i]
+        
+        # 檢查必要數據是否存在
+        if pd.isna(row['SMA5']) or pd.isna(row['SMA10']) or pd.isna(row['SMA50']) or pd.isna(row['SMA60']) or pd.isna(row['SMA150']):
+            return False
+        
+        # 檢查是否有足夠的數據進行各項檢查
+        if i < 90:  # 需要至少 60 + 30 天的數據
+            return False
+        
+        # MA5 最近3天內突破 MA10
+        ma5_breakthrough = False
+        if i >= 3:
+            recent_3_days = self.df.iloc[i-2:i+1]
+            for j in range(len(recent_3_days)):
+                idx = i - 2 + j
+                if idx == 0:
+                    continue
+                
+                curr = self.df.iloc[idx]
+                prev = self.df.iloc[idx - 1]
+                
+                # 檢查是否突破：前一天 MA5 < MA10，當天 MA5 > MA10
+                if (pd.notna(prev['SMA5']) and pd.notna(prev['SMA10']) and
+                    pd.notna(curr['SMA5']) and pd.notna(curr['SMA10'])):
+                    
+                    prev_below = prev['SMA5'] < prev['SMA10']
+                    curr_above = curr['SMA5'] > curr['SMA10']
+                    
+                    if prev_below and curr_above:
+                        ma5_breakthrough = True
+                        break
+        
+        if not ma5_breakthrough:
+            return False
+        
+        # MA60 最近30天連續向上檢查
+        ma60_uptrend = True
+        if i >= 30:
+            recent_30_ma60 = self.df['SMA60'].iloc[i-29:i+1]
+            for j in range(1, len(recent_30_ma60)):
+                if recent_30_ma60.iloc[j] <= recent_30_ma60.iloc[j-1]:
+                    ma60_uptrend = False
+                    break
+        
+        # 最近30天每天K線最低價都沒有低於當天MA60
+        price_support = True
+        if i >= 30:
+            recent_30_days = self.df.iloc[i-29:i+1]
+            for idx in range(len(recent_30_days)):
+                if recent_30_days.iloc[idx]['Low'] < recent_30_days.iloc[idx]['SMA60']:
+                    price_support = False
+                    break
+        
+        if not ma60_uptrend or not price_support:
+            return False
+        
+        # 200MA 需至少上升一個月 (20 日) - 如果數據不足則跳過此條件
+        sma200_trending_up = True
+        if pd.notna(row['SMA200']) and i >= 20:
+            prev_sma200 = self.df['SMA200'].iloc[max(0, i-20)]
+            if pd.notna(prev_sma200):
+                sma200_trending_up = row['SMA200'] > prev_sma200
+        
+        criteria = [
+            row['Close'] > row['SMA150'],  # 價格在 150MA 之上
+            row['SMA50'] > row['SMA150'],  # 50MA 在 150MA 之上
+            row['Close'] > row['SMA50'],   # 價格在 50MA 之上
+        ]
+        
+        # 只有在 SMA200 存在時才加入相關條件
+        if pd.notna(row['SMA200']):
+            criteria.extend([
+                row['Close'] > row['SMA200'],      # 價格在 200MA 之上
+                row['SMA150'] > row['SMA200'],     # 150MA 在 200MA 之上
+                sma200_trending_up,                # 200MA 上揚
+                row['SMA50'] > row['SMA200'],      # 50MA 在 200MA 之上
+            ])
+        
+        # 高低點條件
+        if pd.notna(row['Low52']) and pd.notna(row['High52']):
+            criteria.extend([
+                row['Close'] >= row['Low52'] * 1.30,   # 股價距離低點至少 30%
+                row['Close'] >= row['High52'] * 0.75   # 股價距離高點 25% 以內
+            ])
+        
+        return all(criteria)
+
+    def _check_vcp_pattern(self, i):
+        """
+        篩選準則：辨識 VCP 波動與量能收縮
+        """
+        # 波動收縮：近 5 日平均波幅小於 20 日 ATR 的 80% (代表進入緊緻區)
+        recent_volatility = self.df['PriceRange'].iloc[i-4:i+1].mean()
+        price_tight = recent_volatility < (self.df['ATR'].iloc[i] / self.df['Close'].iloc[i]) * 0.8
+        
+        # 量能枯竭：近 3 日平均量低於 20 日均量的 85%
+        vol_dry_up = self.df['Volume'].iloc[i-2:i+1].mean() < self.df['VolMA20'].iloc[i] * 0.85
+        
+        return price_tight and vol_dry_up
+
+    def _get_signal_score(self, i):
+        """
+        觸發機制：計算 K 線與量能突破的綜合得分
+        """
+        row = self.df.iloc[i]
+        prev = self.df.iloc[i-1]
+        score = 0
+        
+        # A. 量能突破：攻擊量 > 1.5倍
+        if row['VolRatio'] > 1.5: score += 2
+        if row['VolRatio'] > 2.5: score += 3
+        
+        # B. K 線型態：陽包陰 (Bullish Engulfing)
+        is_bullish = row['Close'] > row['Open']
+        was_bearish = prev['Close'] < prev['Open']
+        if is_bullish and was_bearish and row['Close'] > prev['Open'] and row['Open'] < prev['Close']:
+            score += 3
+            
+        # C. 價格行為：長紅棒且收在最高點附近
+        body_size = (row['Close'] - row['Open']) / (row['High'] - row['Low'] + 1e-6)
+        if is_bullish and body_size > 0.8:
+            score += 2
+            
+        # D. 阻力突破：收盤價創近 10 日新高
+        recent_high = self.df['High'].iloc[i-10:i].max()
+        if row['Close'] > recent_high:
+            score += 3
+            
+        return score
+
+    def run_analysis(self):
+        """
+        執行分析並標記起漲點
+        """
+        self.df['Signal'] = 0
+        self.df['Note'] = ""
+        
+        # 從第 150 天開始分析（確保有足夠的技術指標數據）
+        start_idx = max(150, len(self.df) - 500)  # 最多回測500天
+        for i in range(start_idx, len(self.df)):
+            # 1. 趨勢過濾 (環境不對就不看)
+            if not self._check_trend_template(i):
+                continue
+            
+            # 2. 判斷是否有收縮型態 (VCP)
+            vcp_active = self._check_vcp_pattern(i)
+            
+            # 3. 計算突破動能
+            score = self._get_signal_score(i)
+            
+            # 融合判斷邏輯：
+            # 若處於 VCP 緊緻期且出現基本突破 (Score >= 4)
+            # 或出現強勢的無收縮帶量突破 (Score >= 7)
+            if vcp_active and score >= 4:
+                self.df.at[self.df.index[i], 'Signal'] = 1
+                self.df.at[self.df.index[i], 'Note'] = "VCP 收縮後起漲"
+            elif score >= 7:
+                self.df.at[self.df.index[i], 'Signal'] = 1
+                self.df.at[self.df.index[i], 'Note'] = "強勢量價突破"
+                
+        return self.df
+
+# ==============================
+# 📈 【包裝函數】screen_stocks
 # ==============================
 def screen_stocks(df, max_price=150.0, volume_period=15, recent_days=3, ma_uptrend_days=5):
     """
-    股票篩選分析引擎 - 捕捉放量起漲點
-    
-    篩選邏輯：
-    1. 股價上限控制
-    2. MA5 向上 (連續N天上漲)
-    3. MA60 向上 (連續N天上漲)
-    4. 過去VOLUME_PERIOD天內的最高成交量發生在最近RECENT_DAYS天內
+    股票篩選分析引擎 - 使用融合分析引擎
     
     參數:
         df: 股票數據DataFrame
         max_price: 股價上限，預設150元
-        volume_period: 觀察最高成交量的期間（天），預設15天
-        recent_days: 定義「最近N天」，預設3天
-        ma_uptrend_days: 檢查均線連續向上的天數，預設5天
+        volume_period: (保留參數相容性)
+        recent_days: (保留參數相容性)
+        ma_uptrend_days: (保留參數相容性)
     
     返回格式：
     {
         "stock_code": "2330",
         "收盤價": 580.0,
         "latest_date": "2025.01.15",
-        "max_vol_date": "2025.01.14",
-        "max_volume": 50000
+        "signal_note": "VCP 收縮後起漲"
     }
     或 None（不符合條件）
     """
@@ -139,98 +339,70 @@ def screen_stocks(df, max_price=150.0, volume_period=15, recent_days=3, ma_uptre
                 df[col] = df[col].astype(str).str.replace(',', '', regex=False)
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # 需要至少90天數據來計算完整的MA60並檢查30天趨勢
-        if len(df) < 90: 
+        # 需要至少150天數據來計算技術指標
+        if len(df) < 150: 
             return None
-            
-        # 計算均線
-        df['MA5'] = df['收盤價'].rolling(window=5).mean()
-        df['MA60'] = df['收盤價'].rolling(window=60).mean()
         
         latest = df.iloc[-1]
         
-        # ========================================
-        # 條件1: 股價上限
-        # ========================================
+        # 股價上限過濾
         if latest['收盤價'] > max_price:
             return None
         
-        # ========================================
-        # 條件2: MA5 連續向上
-        # ========================================
-        if len(df) < ma_uptrend_days + 1:
+        # 2. 準備引擎需要的欄位名稱 (轉換為英文)
+        engine_df = pd.DataFrame({
+            'Open': df['開盤價'],
+            'High': df['最高價'],
+            'Low': df['最低價'],
+            'Close': df['收盤價'],
+            'Volume': df['成交張數']
+        })
+        
+        # 3. 執行融合分析引擎
+        engine = IntegratedStockAnalysisEngine(engine_df)
+        result_df = engine.run_analysis()
+        
+        # 4. 檢查最近是否有訊號
+        signals = result_df[result_df['Signal'] == 1]
+        if len(signals) == 0:
             return None
+        
+        # 取得最後一個訊號
+        last_signal = signals.iloc[-1]
+        last_signal_idx = signals.index[-1]
+        
+        # 只取最近10天內的訊號
+        if len(result_df) - last_signal_idx > 10:
+            return None
+        
+        # 5. 檢查最近10天的最高成交量是否落於最近3天內
+        if len(df) >= 10:
+            last_10_days_volume = df['成交張數'].iloc[-10:]
+            max_vol_value = last_10_days_volume.max()
             
-        last_n_plus_1 = df.tail(ma_uptrend_days + 1)
-        ma5_uptrend = True
-        
-        for i in range(1, len(last_n_plus_1)):
-            idx_prev = last_n_plus_1.index[i-1]
-            idx_curr = last_n_plus_1.index[i]
+            # 找出最高量的位置（可能有多個相同的最高量，取最後一個）
+            max_vol_positions = last_10_days_volume[last_10_days_volume == max_vol_value]
+            last_max_vol_idx = max_vol_positions.index[-1]
             
-            if pd.notna(last_n_plus_1.loc[idx_prev, 'MA5']) and \
-               pd.notna(last_n_plus_1.loc[idx_curr, 'MA5']):
-                if last_n_plus_1.loc[idx_curr, 'MA5'] <= last_n_plus_1.loc[idx_prev, 'MA5']:
-                    ma5_uptrend = False
-                    break
-            else:
-                ma5_uptrend = False
-                break
-        
-        if not ma5_uptrend:
-            return None
-        
-        # ========================================
-        # 條件3: MA60 最近30天連續向上
-        # ========================================
-        if len(df) < 90:  # 需要至少 60 + 30 天的數據
-            return None
-        
-        # 取最近30天的數據
-        recent_30_days = df.iloc[-30:]
-        ma60_values = recent_30_days['MA60'].values
-        
-        # 檢查最近30天的 MA60 是否連續向上
-        for i in range(1, len(ma60_values)):
-            if ma60_values[i] <= ma60_values[i-1]:
+            # 檢查這個最高量是否在最後3天內
+            last_3_days_indices = df.index[-3:]
+            if last_max_vol_idx not in last_3_days_indices:
                 return None
         
-        # 檢查最近30天每天K線最低價都沒有低於當天MA60
-        for idx, row in recent_30_days.iterrows():
-            if row['最低價'] < row['MA60']:
-                return None
-        
-        
-        # ========================================
-        # 條件4: 過去VOLUME_PERIOD天的最高量在最近RECENT_DAYS天內
-        # ========================================
-        if len(df) < volume_period:
-            return None
-        
-        # 取過去volume_period天的數據
-        last_period = df.tail(volume_period)
-        
-        # 找到最高成交量及其日期
-        max_vol_idx = last_period['成交張數'].idxmax()
-        max_volume = last_period.loc[max_vol_idx, '成交張數']
-        max_vol_date = last_period.loc[max_vol_idx, '日期']
-        
-        # 檢查最高量是否在最近recent_days天內
-        last_recent = df.tail(recent_days)
-        
-        is_recent_max = False
-        for idx, row in last_recent.iterrows():
-            if row['日期'] == max_vol_date:
-                is_recent_max = True
-                break
-        
-        if not is_recent_max:
-            return None
-        
-        # ========================================
-        # 通過所有條件，返回結果
-        # ========================================
+        # 6. 返回結果
         stock_code = str(latest.get('股票代碼', ''))
+        
+        return {
+            'stock_code': stock_code,
+            '收盤價': float(latest['收盤價']),
+            'latest_date': df['日期'].iloc[-1].strftime('%Y.%m.%d'),
+            'signal_note': str(last_signal['Note']),
+            'max_vol_date': df['日期'].iloc[-1].strftime('%Y.%m.%d'),  # 保留相容性
+            'max_volume': int(df['成交張數'].iloc[-1])  # 保留相容性
+        }
+        
+    except Exception as e:
+        return None
         
         return {
             'stock_code': stock_code,
@@ -334,7 +506,7 @@ def generate_stock_chart(stock_code, stock_name, csv_file, output_folder, stock_
         
         # ===== 執行篩選分析（用新的 screen_stocks 引擎）=====
         screen_result = screen_stocks(df, max_price=MAX_PRICE, volume_period=VOLUME_PERIOD,
-                                     recent_days=RECENT_DAYS, ma_uptrend_days=MA5_UPTREND_DAYS)
+                                     recent_days=RECENT_DAYS, ma_uptrend_days=MA_UPTREND_DAYS)
         
         # 轉換成原本 analyze_volume_price_pattern 的格式
         if screen_result:
@@ -925,7 +1097,7 @@ def main():
     base_output_folder.mkdir(exist_ok=True)
     
     # 建立以日期命名的子資料夾（前綴 full_）
-    output_folder = base_output_folder / f"full_{latest_date_str}_MA"
+    output_folder = base_output_folder / f"full_{latest_date_str}_Mixed"
     
     # 如果資料夾已存在，先清空內容
     if output_folder.exists():
@@ -954,9 +1126,14 @@ def main():
     # 新的篩選條件說明
     enabled = [
         f"股價 ≤ {MAX_PRICE}元",
-        f"MA5 連續{MA5_UPTREND_DAYS}天向上",
+        f"MA5 最近3天內突破 MA10",
+        f"最近10天的最高成交量落於最近3天內",
         f"MA60 最近30天連續向上",
-        f"過去{VOLUME_PERIOD}天最高量在最近{RECENT_DAYS}天內"
+        f"最近30天每天K線最低價都沒有低於當天MA60",
+        f"Minervini 第二階段趨勢模板",
+        f"VCP 波動收縮型態檢測",
+        f"帶量 K 線突破訊號",
+        f"最近10天內出現起漲訊號"
     ]
     
     print(f"🔍 掃描 {len(stock_codes)} 檔股票...")
@@ -974,13 +1151,14 @@ def main():
             continue
         
         res = screen_stocks(df, max_price=MAX_PRICE, volume_period=VOLUME_PERIOD,
-                           recent_days=RECENT_DAYS, ma_uptrend_days=MA5_UPTREND_DAYS)
+                           recent_days=RECENT_DAYS, ma_uptrend_days=MA_UPTREND_DAYS)
         
         if res:
             results.append({
                 'code': res['stock_code'],
                 'latest_date': res['latest_date'],
                 'latest_close': res['收盤價'],
+                'signal_note': res.get('signal_note', ''),
                 'max_vol_date': res['max_vol_date'],
                 'max_volume': res['max_volume'],
                 'last_volume': df['成交張數'].iloc[-1] if '成交張數' in df.columns else 0
@@ -1019,6 +1197,7 @@ def main():
 
             print(f"{code} | {name} | {type_str} | {sector}")
             print(f"    📅 日期: {r['latest_date']} | 💰 收盤: {r['latest_close']:.2f}")
+            print(f"    🎯 訊號: {r.get('signal_note', '未知')}") 
             print(f"    💥 最高量日: {r['max_vol_date']} ({r['max_volume']} 張)")
             
             # 讀取股票資料
